@@ -112,12 +112,12 @@ class MarketDataFetcher:
                     self._oi_history[symbol].append(oi)
 
                     return {
-                        "funding_rate": float(ctx.get("funding", 0)),
+                        "funding_rate": float(ctx.get("funding") or 0),
                         "open_interest": oi,
                         "oi_history": list(self._oi_history[symbol]),
-                        "mark_price": float(ctx.get("markPx", 0)),
-                        "premium": float(ctx.get("premium", 0)),
-                        "day_volume": float(ctx.get("dayNtlVlm", 0)),
+                        "mark_price": float(ctx.get("markPx") or 0),
+                        "premium": float(ctx.get("premium") or 0),
+                        "day_volume": float(ctx.get("dayNtlVlm") or 0),
                     }
             return {}
         except Exception:
@@ -138,6 +138,41 @@ class MarketDataFetcher:
             ]
         except Exception:
             logger.exception("Failed to fetch funding history for %s", symbol)
+            return []
+
+    async def get_all_funding_and_oi(self) -> list[dict]:
+        """Get funding rate, OI, mark price, premium, and volume for ALL perp coins.
+
+        Uses a single API call (meta_and_asset_ctxs) so this is efficient.
+        """
+        try:
+            raw = await self.client._run_sync(self.client.info.meta_and_asset_ctxs)
+            meta = raw[0]
+            ctxs = raw[1]
+
+            results = []
+            for asset, ctx in zip(meta.get("universe", []), ctxs):
+                symbol = asset.get("name", "")
+                if not symbol:
+                    continue
+                oi = float(ctx.get("openInterest", 0))
+
+                # Update in-memory OI history
+                if symbol not in self._oi_history:
+                    self._oi_history[symbol] = deque(maxlen=24)
+                self._oi_history[symbol].append(oi)
+
+                results.append({
+                    "symbol": symbol,
+                    "funding_rate": float(ctx.get("funding") or 0),
+                    "open_interest": oi,
+                    "mark_price": float(ctx.get("markPx") or 0),
+                    "premium": float(ctx.get("premium") or 0),
+                    "day_volume": float(ctx.get("dayNtlVlm") or 0),
+                })
+            return results
+        except Exception:
+            logger.exception("Failed to fetch all funding/OI data")
             return []
 
     async def get_market_info(self, symbol: str) -> dict:

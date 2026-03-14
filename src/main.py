@@ -15,7 +15,7 @@ from src.exchange.client import HyperliquidClient
 from src.exchange.market_data import MarketDataFetcher
 from src.exchange.orders import OrderManager
 from src.risk.manager import RiskManager
-from src.scheduler import daily_pnl_rollup, health_check, monitor_positions, scan_markets
+from src.scheduler import collect_funding_oi, daily_pnl_rollup, health_check, monitor_positions, scan_markets
 
 
 def setup_logging() -> None:
@@ -58,6 +58,7 @@ async def post_init(application) -> None:
     job_queue.run_repeating(scan_markets, interval=settings.scan_interval_minutes * 60, first=10)
     job_queue.run_repeating(monitor_positions, interval=30, first=5)
     job_queue.run_repeating(health_check, interval=60, first=15)
+    job_queue.run_repeating(collect_funding_oi, interval=900, first=20)  # every 15 min
     job_queue.run_daily(daily_pnl_rollup, time=dt_time(hour=0, minute=0))
 
     # Register commands for Telegram auto-complete menu

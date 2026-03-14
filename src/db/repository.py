@@ -267,3 +267,55 @@ class Repository:
     async def delete_alert(self, alert_id: int) -> None:
         await self.db.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
         await self.db.commit()
+
+    # ── Funding / OI Snapshots ──────────────────────────────
+
+    async def insert_funding_oi_batch(self, snapshots: list[dict]) -> int:
+        """Insert a batch of funding/OI snapshots. Returns number inserted."""
+        if not snapshots:
+            return 0
+        await self.db.executemany(
+            """INSERT INTO funding_oi_snapshots
+               (symbol, funding_rate, open_interest, mark_price, premium, day_volume)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            [
+                (s["symbol"], s["funding_rate"], s["open_interest"],
+                 s["mark_price"], s.get("premium", 0), s.get("day_volume", 0))
+                for s in snapshots
+            ],
+        )
+        await self.db.commit()
+        return len(snapshots)
+
+    async def get_funding_oi_history(
+        self, symbol: str, hours: int = 24
+    ) -> list[dict]:
+        """Get funding/OI snapshots for a symbol over the last N hours."""
+        cursor = await self.db.execute(
+            """SELECT * FROM funding_oi_snapshots
+               WHERE symbol = ? AND timestamp >= datetime('now', ?)
+               ORDER BY timestamp ASC""",
+            (symbol, f"-{hours} hours"),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_funding_oi_all(self, hours: int = 24) -> list[dict]:
+        """Get funding/OI snapshots for all symbols over the last N hours."""
+        cursor = await self.db.execute(
+            """SELECT * FROM funding_oi_snapshots
+               WHERE timestamp >= datetime('now', ?)
+               ORDER BY symbol, timestamp ASC""",
+            (f"-{hours} hours",),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def cleanup_old_snapshots(self, days: int = 90) -> int:
+        """Delete funding/OI snapshots older than N days."""
+        cursor = await self.db.execute(
+            "DELETE FROM funding_oi_snapshots WHERE timestamp < datetime('now', ?)",
+            (f"-{days} days",),
+        )
+        await self.db.commit()
+        return cursor.rowcount

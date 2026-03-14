@@ -483,7 +483,7 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     use_strategy = "strategy" in flags
 
     # Check if any arg looks like inline indicators
-    all_ind_names = {"ema", "rsi", "macd", "support_resistance", "volume", "fvg", "ad", "stoch_rsi"}
+    all_ind_names = {"ema", "rsi", "macd", "support_resistance", "volume", "fvg", "ad", "stoch_rsi", "funding_rate", "open_interest"}
     strategy_indicators = None
     strategy_combos = None
     for a in args[1:]:
@@ -537,13 +537,35 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await update.message.reply_text(formatters.format_error(f"Not enough data for {symbol} ({len(df)} candles)"))
             return
 
+        # Fetch funding rate history from API (hourly, available historically)
+        import pandas as pd
+        funding_data = None
+        try:
+            funding_history = await market_data.get_funding_history(symbol, hours=days * 24)
+            if funding_history:
+                funding_data = pd.DataFrame(funding_history)
+                funding_data["time"] = pd.to_datetime(funding_data["time"], unit="ms")
+        except Exception:
+            logger.warning("Could not fetch funding history for backtest: %s", symbol)
+
+        # Fetch OI data from DB (only available if we've been collecting)
+        oi_data = None
+        try:
+            repo = _get_repo(context)
+            oi_rows = await repo.get_funding_oi_history(symbol, hours=days * 24)
+            if oi_rows:
+                oi_data = pd.DataFrame(oi_rows)
+                oi_data["timestamp"] = pd.to_datetime(oi_data["timestamp"])
+        except Exception:
+            logger.warning("Could not fetch OI history for backtest: %s", symbol)
+
         from src.analysis.backtest import run_backtest, run_indicator_breakdown
 
         if breakdown:
-            results = run_indicator_breakdown(df, symbol, days)
+            results = run_indicator_breakdown(df, symbol, days, funding_data=funding_data, oi_data=oi_data)
             text = formatters.format_indicator_breakdown(results)
         else:
-            result = run_backtest(df, symbol, days, active_indicators=strategy_indicators, combos=strategy_combos)
+            result = run_backtest(df, symbol, days, active_indicators=strategy_indicators, combos=strategy_combos, funding_data=funding_data, oi_data=oi_data)
             text = formatters.format_backtest(result)
 
         # Telegram has a 4096 char limit — split if needed

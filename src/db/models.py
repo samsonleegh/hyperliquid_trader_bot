@@ -72,6 +72,19 @@ CREATE TABLE IF NOT EXISTS alerts (
     triggered BOOLEAN DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS funding_oi_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    funding_rate REAL NOT NULL,
+    open_interest REAL NOT NULL,
+    mark_price REAL NOT NULL,
+    premium REAL,
+    day_volume REAL,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_funding_oi_symbol_ts ON funding_oi_snapshots (symbol, timestamp);
 """
 
 DEFAULT_RISK_SETTINGS = {

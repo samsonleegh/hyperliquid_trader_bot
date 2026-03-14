@@ -7,13 +7,13 @@ from itertools import combinations
 import pandas as pd
 
 from src.analysis.indicators import TechnicalIndicators
-from src.analysis.signals import SignalGenerator
+from src.analysis.signals import SignalGenerator, check_funding_rate, check_open_interest
 from src.config import settings
 
 logger = logging.getLogger(__name__)
 
 MIN_WARMUP = 50
-ALL_INDICATORS = ["ema", "rsi", "macd", "support_resistance", "volume", "fvg", "ad", "stoch_rsi"]
+ALL_INDICATORS = ["ema", "rsi", "macd", "support_resistance", "volume", "fvg", "ad", "stoch_rsi", "funding_rate", "open_interest"]
 
 TAKER_FEE = 0.00035  # 0.035% per side
 MAX_PORTFOLIO_PCT = 0.20  # 20% of portfolio per trade
@@ -70,6 +70,7 @@ def _generate_signal_with_subset(
     active_indicators: set[str],
     sl_pct: float,
     tp_pct: float,
+    extra_checks: dict | None = None,
 ) -> dict | None:
     """Run signal generation using only a subset of indicators."""
     all_checks = {
@@ -89,6 +90,11 @@ def _generate_signal_with_subset(
             checks[name] = func()
         else:
             checks[name] = {"signal": None, "detail": "disabled"}
+
+    # Merge pre-computed async checks (funding_rate, open_interest)
+    if extra_checks:
+        for name, result in extra_checks.items():
+            checks[name] = result
 
     active_checks = {k: v for k, v in checks.items() if k in active_indicators}
     bullish = sum(1 for c in active_checks.values() if c.get("signal") == "bullish")
@@ -139,6 +145,7 @@ def _generate_signal_with_combos(
     combos: list[list[str]],
     sl_pct: float,
     tp_pct: float,
+    extra_checks: dict | None = None,
 ) -> dict | None:
     """Run signal generation using combo logic — any combo must unanimously agree."""
     all_checks = {
@@ -162,6 +169,12 @@ def _generate_signal_with_combos(
             checks[name] = func()
         else:
             checks[name] = {"signal": None, "detail": "disabled"}
+
+    # Merge pre-computed async checks (funding_rate, open_interest)
+    if extra_checks:
+        for name, result in extra_checks.items():
+            checks[name] = result
+            needed.add(name)
 
     best_combo = None
     best_direction = None
@@ -229,6 +242,8 @@ def _simulate_trades(
     starting_capital: float,
     label: str,
     combos: list[list[str]] | None = None,
+    funding_data: pd.DataFrame | None = None,
+    oi_data: pd.DataFrame | None = None,
 ) -> BacktestResult:
     """Core simulation loop with portfolio sizing and fees."""
     result = BacktestResult(
@@ -313,13 +328,51 @@ def _simulate_trades(
             ind = TechnicalIndicators(window)
             ind.calc_all()
             gen = SignalGenerator(ind)
+
+            # Build extra_checks for funding_rate and open_interest
+            extra_checks = {}
+            use_funding = "funding_rate" in active_indicators or (combos and any("funding_rate" in c for c in combos))
+            use_oi = "open_interest" in active_indicators or (combos and any("open_interest" in c for c in combos))
+
+            if use_funding or use_oi:
+                # Calculate price change % over last 8 bars (~2h on 15m candles)
+                if i >= 8:
+                    price_change_pct = (float(df.iloc[i]["close"]) - float(df.iloc[i - 8]["close"])) / float(df.iloc[i - 8]["close"]) * 100
+                    recent_vol = df["volume"].iloc[i - 3:i + 1].mean()
+                    prev_vol = df["volume"].iloc[i - 7:i - 3].mean()
+                    volume_change_pct = (recent_vol - prev_vol) / prev_vol if prev_vol > 0 else 0
+                else:
+                    price_change_pct = 0
+                    volume_change_pct = 0
+
+            if use_funding and funding_data is not None and not funding_data.empty:
+                candle_time = row["timestamp"]
+                # Find the most recent funding rate at or before this candle
+                mask = funding_data["time"] <= candle_time
+                if mask.any():
+                    funding_row = funding_data.loc[mask].iloc[-1]
+                    funding_dict = {"funding_rate": funding_row["rate"]}
+                    extra_checks["funding_rate"] = check_funding_rate(funding_dict, [], price_change_pct)
+
+            if use_oi and oi_data is not None and not oi_data.empty:
+                candle_time = row["timestamp"]
+                mask = oi_data["timestamp"] <= candle_time
+                if mask.any():
+                    recent_oi = oi_data.loc[mask]
+                    oi_val = float(recent_oi.iloc[-1]["open_interest"])
+                    oi_history = recent_oi["open_interest"].tolist()[-24:]
+                    oi_dict = {"open_interest": oi_val}
+                    extra_checks["open_interest"] = check_open_interest(oi_dict, price_change_pct, volume_change_pct, oi_history=oi_history)
+
             if combos:
                 signal = _generate_signal_with_combos(
-                    gen, symbol, current_price, combos, sl_pct, tp_pct
+                    gen, symbol, current_price, combos, sl_pct, tp_pct,
+                    extra_checks=extra_checks or None,
                 )
             else:
                 signal = _generate_signal_with_subset(
-                    gen, symbol, current_price, active_indicators, sl_pct, tp_pct
+                    gen, symbol, current_price, active_indicators, sl_pct, tp_pct,
+                    extra_checks=extra_checks or None,
                 )
         except Exception:
             continue
@@ -384,6 +437,8 @@ def run_backtest(
     starting_capital: float = 1000.0,
     active_indicators: set[str] | None = None,
     combos: list[list[str]] | None = None,
+    funding_data: pd.DataFrame | None = None,
+    oi_data: pd.DataFrame | None = None,
 ) -> BacktestResult:
     """Run backtest with all indicators, a custom subset, or combo groups."""
     sl_pct = sl_pct or settings.default_sl_pct
@@ -402,6 +457,7 @@ def run_backtest(
     return _simulate_trades(
         df, symbol, period_days,
         indicators, sl_pct, tp_pct, starting_capital, label, combos=combos,
+        funding_data=funding_data, oi_data=oi_data,
     )
 
 
@@ -412,6 +468,8 @@ def run_indicator_breakdown(
     sl_pct: float | None = None,
     tp_pct: float | None = None,
     starting_capital: float = 1000.0,
+    funding_data: pd.DataFrame | None = None,
+    oi_data: pd.DataFrame | None = None,
 ) -> list[BacktestResult]:
     """Run backtests for each individual indicator and all 2-indicator combos."""
     sl_pct = sl_pct or settings.default_sl_pct
@@ -422,6 +480,7 @@ def run_indicator_breakdown(
     results.append(_simulate_trades(
         df, symbol, period_days,
         set(ALL_INDICATORS), sl_pct, tp_pct, starting_capital, "ALL COMBINED",
+        funding_data=funding_data, oi_data=oi_data,
     ))
 
     # Each indicator solo
@@ -429,6 +488,7 @@ def run_indicator_breakdown(
         result = _simulate_trades(
             df, symbol, period_days,
             {ind_name}, sl_pct, tp_pct, starting_capital, ind_name,
+            funding_data=funding_data, oi_data=oi_data,
         )
         results.append(result)
 
@@ -438,6 +498,7 @@ def run_indicator_breakdown(
         result = _simulate_trades(
             df, symbol, period_days,
             set(combo), sl_pct, tp_pct, starting_capital, label,
+            funding_data=funding_data, oi_data=oi_data,
         )
         results.append(result)
 

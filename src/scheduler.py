@@ -219,6 +219,22 @@ async def daily_pnl_rollup(context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info("Daily PnL rollup complete for %s", today)
 
 
+async def collect_funding_oi(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Collect funding rate and OI snapshots for all coins and store to DB."""
+    repo = context.bot_data["repo"]
+    market_data = context.bot_data["market_data"]
+
+    try:
+        snapshots = await market_data.get_all_funding_and_oi()
+        if snapshots:
+            count = await repo.insert_funding_oi_batch(snapshots)
+            logger.info("Collected funding/OI snapshots for %d coins", count)
+        else:
+            logger.warning("No funding/OI data returned")
+    except Exception:
+        logger.exception("Failed to collect funding/OI snapshots")
+
+
 async def health_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Verify Hyperliquid API connectivity."""
     client = context.bot_data["client"]
