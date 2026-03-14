@@ -1,0 +1,7 @@
+python-telegram-bot[ext]>=20.0
+hyperliquid-python-sdk
+pandas
+ta
+aiosqlite
+apscheduler>=3.10
+python-dotenv
