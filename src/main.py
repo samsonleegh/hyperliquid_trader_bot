@@ -15,7 +15,10 @@ from src.exchange.client import HyperliquidClient
 from src.exchange.market_data import MarketDataFetcher
 from src.exchange.orders import OrderManager
 from src.risk.manager import RiskManager
-from src.scheduler import collect_funding_oi, daily_pnl_rollup, health_check, monitor_positions, scan_markets
+from src.scheduler import (
+    collect_funding_oi, collect_news_sentiment, daily_pnl_rollup,
+    detect_whale_activity, health_check, monitor_positions, scan_markets,
+)
 
 
 def setup_logging() -> None:
@@ -46,12 +49,21 @@ async def post_init(application) -> None:
     market_data = MarketDataFetcher(client)
     risk_manager = RiskManager(repo, client)
 
+    # Sentiment & Whale tracking
+    from src.sentiment.news import NewsCollector
+    from src.sentiment.whales import WhaleDetector
+
+    news_collector = NewsCollector(settings.cryptopanic_api_key)
+    whale_detector = WhaleDetector(settings.coinglass_api_key)
+
     # Store in bot_data for access in handlers
     application.bot_data["repo"] = repo
     application.bot_data["client"] = client
     application.bot_data["order_manager"] = order_manager
     application.bot_data["market_data"] = market_data
     application.bot_data["risk_manager"] = risk_manager
+    application.bot_data["news_collector"] = news_collector
+    application.bot_data["whale_detector"] = whale_detector
 
     # Schedule periodic tasks
     job_queue = application.job_queue
@@ -59,6 +71,8 @@ async def post_init(application) -> None:
     job_queue.run_repeating(monitor_positions, interval=30, first=5)
     job_queue.run_repeating(health_check, interval=60, first=15)
     job_queue.run_repeating(collect_funding_oi, interval=900, first=20)  # every 15 min
+    job_queue.run_repeating(collect_news_sentiment, interval=900, first=25)  # every 15 min
+    job_queue.run_repeating(detect_whale_activity, interval=900, first=40)  # every 15 min, after OI
     job_queue.run_daily(daily_pnl_rollup, time=dt_time(hour=0, minute=0))
 
     # Register commands for Telegram auto-complete menu

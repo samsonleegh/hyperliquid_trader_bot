@@ -1,0 +1,12 @@
+app = "hlbot"
+primary_region = "sjc"
+
+[build]
+
+[mounts]
+  source = "botdata"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

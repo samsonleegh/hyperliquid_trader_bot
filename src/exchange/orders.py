@@ -43,6 +43,11 @@ class OrderManager:
         """Place a market order with optional SL/TP."""
         is_buy = side.lower() == "long"
         try:
+            # Check for existing position to detect duplicate on retry
+            pre_positions = await self.client.get_open_positions()
+            pre_pos = next((p for p in pre_positions if p["symbol"] == symbol), None)
+            pre_size = pre_pos["size"] if pre_pos else 0
+
             result = await self.client._run_sync(
                 self.client.exchange.market_open,
                 symbol,
@@ -51,6 +56,16 @@ class OrderManager:
                 None,
                 0.01,
             )
+
+            # Verify position actually changed — guard against silent failures
+            try:
+                post_positions = await self.client.get_open_positions()
+                post_pos = next((p for p in post_positions if p["symbol"] == symbol), None)
+                post_size = post_pos["size"] if post_pos else 0
+                if post_size == pre_size:
+                    logger.warning("Market order for %s returned OK but position unchanged (%.4f -> %.4f)", symbol, pre_size, post_size)
+            except Exception:
+                logger.debug("Could not verify position after market order for %s", symbol)
             logger.info("Market order: %s %s %s -> %s", side, size, symbol, result)
 
             success, error = _check_order_result(result)

@@ -2,11 +2,43 @@
 
 import logging
 
+import pandas as pd
+
 from src.analysis.indicators import TechnicalIndicators
 from src.config import settings
 from src.exchange.orders import _round_price
 
 logger = logging.getLogger(__name__)
+
+
+def compute_htf_trend(df_1h: pd.DataFrame) -> str | None:
+    """Compute higher-timeframe trend from 1h EMA 9/21.
+
+    Returns 'bullish', 'bearish', or None (insufficient data).
+    """
+    if df_1h is None or len(df_1h) < 21:
+        return None
+    ind = TechnicalIndicators(df_1h)
+    ind.calc_emas(periods=[9, 21])
+    last = ind.df.iloc[-1]
+    if pd.isna(last.get("ema_9")) or pd.isna(last.get("ema_21")):
+        return None
+    if last["ema_9"] > last["ema_21"]:
+        return "bullish"
+    elif last["ema_9"] < last["ema_21"]:
+        return "bearish"
+    return None
+
+
+def htf_agrees(htf_trend: str | None, signal_direction: str) -> bool:
+    """Check if the higher-timeframe trend agrees with the signal direction."""
+    if htf_trend is None:
+        return True  # No HTF data — don't block
+    if signal_direction == "long" and htf_trend == "bullish":
+        return True
+    if signal_direction == "short" and htf_trend == "bearish":
+        return True
+    return False
 
 # Active indicators — remove names from this set to disable them
 ACTIVE_INDICATORS: set[str] = {"ema", "rsi", "macd", "support_resistance", "volume", "fvg", "ad", "stoch_rsi"}
@@ -16,8 +48,8 @@ ACTIVE_INDICATORS: set[str] = {"ema", "rsi", "macd", "support_resistance", "volu
 FUNDING_EXTREME_THRESHOLD = 0.0001  # 0.01% hourly (very extreme)
 FUNDING_MODERATE_THRESHOLD = 0.00005  # 0.005% hourly (moderate)
 
-# OI rate-of-change threshold: 5% change over lookback period is significant
-OI_ROC_THRESHOLD = 0.05
+# OI rate-of-change threshold: 2% change over lookback period is significant
+OI_ROC_THRESHOLD = 0.02
 
 
 class SignalGenerator:
@@ -433,13 +465,76 @@ def check_open_interest(funding_data: dict, price_change_pct: float, volume_chan
     return {"signal": None, "detail": f"{oi_display} — neutral"}
 
 
-async def scan_symbol(symbol: str, market_data_fetcher, risk_settings: dict, active_indicators: set[str] | None = None, combos: list[list[str]] | None = None) -> dict | None:
+async def check_news_sentiment(symbol: str, repo) -> dict:
+    """Check recent news sentiment for a symbol.
+
+    Queries news_sentiment table for the last 4 hours and aggregates scores.
+    """
+    try:
+        news = await repo.get_recent_news(symbol, hours=4)
+        if not news:
+            return {"signal": None, "detail": "No recent news"}
+
+        scores = [n["sentiment_score"] for n in news if n.get("sentiment_score") is not None]
+        if not scores:
+            return {"signal": None, "detail": f"News: {len(news)} articles (no scores)"}
+
+        avg_score = sum(scores) / len(scores)
+
+        if avg_score > 0.3:
+            return {"signal": "bullish", "detail": f"News sentiment: bullish ({avg_score:+.2f}, {len(news)} articles)"}
+        elif avg_score < -0.3:
+            return {"signal": "bearish", "detail": f"News sentiment: bearish ({avg_score:+.2f}, {len(news)} articles)"}
+        return {"signal": None, "detail": f"News sentiment: neutral ({avg_score:+.2f}, {len(news)} articles)"}
+    except Exception:
+        logger.warning("Could not check news sentiment for %s", symbol)
+        return {"signal": None, "detail": "News data unavailable"}
+
+
+async def check_whale_activity(symbol: str, repo) -> dict:
+    """Check recent whale activity for a symbol.
+
+    Queries whale_events table for the last 2 hours.
+    """
+    try:
+        events = await repo.get_recent_whale_events(symbol, hours=2)
+        if not events:
+            return {"signal": None, "detail": "No recent whale activity"}
+
+        longs = sum(1 for e in events if e.get("direction") == "long")
+        shorts = sum(1 for e in events if e.get("direction") == "short")
+        total = len(events)
+
+        if longs > shorts and longs >= 1:
+            return {"signal": "bullish", "detail": f"Whale activity: {longs} long / {shorts} short ({total} events)"}
+        elif shorts > longs and shorts >= 1:
+            return {"signal": "bearish", "detail": f"Whale activity: {shorts} short / {longs} long ({total} events)"}
+        return {"signal": None, "detail": f"Whale activity: mixed ({total} events)"}
+    except Exception:
+        logger.warning("Could not check whale activity for %s", symbol)
+        return {"signal": None, "detail": "Whale data unavailable"}
+
+
+async def scan_symbol(symbol: str, market_data_fetcher, risk_settings: dict, active_indicators: set[str] | None = None, combos: list[list[str]] | None = None, repo=None, htf: bool | None = None) -> dict | None:
     """Fetch candles, run TA, and generate a signal for a symbol."""
     try:
-        df = await market_data_fetcher.get_candles(symbol, interval="15m", limit=100)
+        df = await market_data_fetcher.get_candles(symbol, interval=settings.scan_interval, limit=100)
         if df.empty or len(df) < 30:
             logger.warning("Insufficient data for %s (%d candles)", symbol, len(df))
             return None
+
+        # Fetch 1h candles for higher-timeframe confirmation
+        # Per-strategy htf overrides global setting
+        use_htf = htf if htf is not None else settings.htf_confirmation
+        htf_trend = None
+        df_1h = None
+        if use_htf:
+            try:
+                df_1h = await market_data_fetcher.get_candles(symbol, interval="1h", limit=50)
+                htf_trend = compute_htf_trend(df_1h)
+                logger.debug("HTF trend for %s: %s", symbol, htf_trend)
+            except Exception:
+                logger.warning("Could not fetch 1h candles for %s, skipping HTF filter", symbol)
 
         ind = TechnicalIndicators(df)
         ind.calc_all()
@@ -462,10 +557,30 @@ async def scan_symbol(symbol: str, market_data_fetcher, risk_settings: dict, act
                 volume_change_pct = 0
 
             extra_checks["funding_rate"] = check_funding_rate(funding_data, funding_history, price_change_pct)
+
+            # Use DB-stored OI history (persists across restarts) instead of in-memory deque
             oi_history = funding_data.get("oi_history", [])
+            if repo:
+                try:
+                    oi_rows = await repo.get_funding_oi_history(symbol, hours=6)
+                    if oi_rows:
+                        oi_history = [r["open_interest"] for r in oi_rows]
+                except Exception:
+                    logger.debug("Could not fetch DB OI history for %s, using in-memory", symbol)
             extra_checks["open_interest"] = check_open_interest(funding_data, price_change_pct, volume_change_pct, oi_history=oi_history)
         except Exception:
             logger.warning("Could not fetch funding/OI for %s", symbol)
+
+        # News sentiment & whale activity (require repo)
+        if repo:
+            try:
+                extra_checks["news_sentiment"] = await check_news_sentiment(symbol, repo)
+            except Exception:
+                logger.warning("Could not check news sentiment for %s", symbol)
+            try:
+                extra_checks["whale_activity"] = await check_whale_activity(symbol, repo)
+            except Exception:
+                logger.warning("Could not check whale activity for %s", symbol)
 
         gen = SignalGenerator(ind)
         if combos:
@@ -474,9 +589,48 @@ async def scan_symbol(symbol: str, market_data_fetcher, risk_settings: dict, act
             signal = gen.generate_signal(symbol, current_price, active_set=active_indicators, extra_checks=extra_checks or None)
 
         if signal:
+            # Higher-timeframe confirmation filter
+            if use_htf and not htf_agrees(htf_trend, signal["direction"]):
+                logger.info(
+                    "HTF filter rejected %s %s signal (1h trend: %s)",
+                    symbol, signal["direction"], htf_trend,
+                )
+                signal["direction"] = None
+                signal["confidence"] = 0
+                signal["htf_filtered"] = True
+                signal["htf_trend"] = htf_trend
+                return signal
+
+            # Use 1h S/R for SL/TP if available (stronger levels)
+            if df_1h is not None and len(df_1h) >= 21:
+                ind_1h = TechnicalIndicators(df_1h)
+                supports_1h, resistances_1h = ind_1h.calc_support_resistance()
+                if supports_1h or resistances_1h:
+                    min_distance = current_price * 0.01
+                    sl_pct = settings.default_sl_pct
+                    tp_pct = settings.default_tp_pct
+                    default_sl = current_price * (1 - sl_pct / 100) if signal["direction"] == "long" else current_price * (1 + sl_pct / 100)
+                    default_tp = current_price * (1 + tp_pct / 100) if signal["direction"] == "long" else current_price * (1 - tp_pct / 100)
+
+                    if signal["direction"] == "long":
+                        sr_sl = max((s for s in supports_1h if s < current_price), default=None)
+                        sr_tp = min((r for r in resistances_1h if r > current_price), default=None)
+                        sl_price = sr_sl if sr_sl and current_price - sr_sl >= min_distance else default_sl
+                        tp_price = sr_tp if sr_tp and sr_tp - current_price >= min_distance else default_tp
+                    else:
+                        sr_sl = min((r for r in resistances_1h if r > current_price), default=None)
+                        sr_tp = max((s for s in supports_1h if s < current_price), default=None)
+                        sl_price = sr_sl if sr_sl and sr_sl - current_price >= min_distance else default_sl
+                        tp_price = sr_tp if sr_tp and current_price - sr_tp >= min_distance else default_tp
+
+                    signal["sl_price"] = _round_price(sl_price, 0)
+                    signal["tp_price"] = _round_price(tp_price, 0)
+                    logger.debug("Using 1h S/R for %s SL/TP: sl=%.2f tp=%.2f", symbol, sl_price, tp_price)
+
+            signal["htf_trend"] = htf_trend
             max_pos = risk_settings.get("max_position_size", settings.max_position_size)
             signal["suggested_size"] = round(max_pos / current_price, 6)
-            logger.info("Signal generated for %s: %s (confidence=%.2f)", symbol, signal["direction"], signal["confidence"])
+            logger.info("Signal generated for %s: %s (confidence=%.2f, htf=%s)", symbol, signal["direction"], signal["confidence"], htf_trend)
             return signal
 
         # No signal — still return indicator details for display

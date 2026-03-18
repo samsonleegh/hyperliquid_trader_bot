@@ -29,12 +29,48 @@ def _parse_strategy_indicators(strategy: dict | None) -> tuple[set[str] | None, 
     return set(indicators), None
 
 
+async def _cleanup_stale_trades(repo, client) -> None:
+    """Close DB trades that no longer exist as positions on Hyperliquid."""
+    try:
+        open_trades = await repo.get_open_trades()
+        if not open_trades:
+            return
+
+        positions = await client.get_open_positions()
+        exchange_symbols = {p["symbol"] for p in positions}
+
+        from collections import defaultdict
+        by_symbol = defaultdict(list)
+        cleaned = 0
+
+        for trade in open_trades:
+            if trade["symbol"] not in exchange_symbols:
+                await repo.close_trade(trade["id"], trade["entry_price"], 0)
+                cleaned += 1
+            else:
+                by_symbol[trade["symbol"]].append(trade)
+
+        # Close duplicate trades per symbol — keep only the latest
+        for symbol, trades in by_symbol.items():
+            if len(trades) > 1:
+                trades.sort(key=lambda t: t["id"], reverse=True)
+                for stale in trades[1:]:
+                    await repo.close_trade(stale["id"], stale["entry_price"], 0)
+                    cleaned += 1
+
+        if cleaned:
+            logger.info("Pre-scan cleanup: closed %d stale trade(s) in DB", cleaned)
+    except Exception:
+        logger.warning("Pre-scan cleanup failed, continuing with scan")
+
+
 async def scan_markets(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Periodic TA scan on all watchlist symbols, using per-coin strategies when configured."""
     import math
 
     repo = context.bot_data["repo"]
     market_data = context.bot_data["market_data"]
+    client = context.bot_data["client"]
     risk_mgr = context.bot_data["risk_manager"]
     order_mgr = context.bot_data["order_manager"]
     risk_settings = await risk_mgr.get_settings()
@@ -42,6 +78,9 @@ async def scan_markets(context: ContextTypes.DEFAULT_TYPE) -> None:
     symbols = await repo.get_watchlist()
     if not symbols:
         return
+
+    # Auto-cleanup stale DB trades before scanning
+    await _cleanup_stale_trades(repo, client)
 
     # Load per-coin strategies
     strategies = await repo.get_all_strategies()
@@ -51,18 +90,25 @@ async def scan_markets(context: ContextTypes.DEFAULT_TYPE) -> None:
     open_trades = await repo.get_open_trades()
     open_symbols = {t["symbol"] for t in open_trades}
 
-    logger.info("Scanning %d watchlist symbols (%d with open positions)", len(symbols), len(open_symbols))
+    logger.info("Scanning %d watchlist symbols (%d with open positions: %s)", len(symbols), len(open_symbols), ", ".join(open_symbols) if open_symbols else "none")
     for symbol in symbols:
         if symbol in open_symbols:
-            logger.debug("Skipping %s — already has open position", symbol)
+            logger.info("Skipping %s — already has open trade in DB", symbol)
             continue
 
         try:
             strategy = strategy_map.get(symbol)
             active_indicators, combos = _parse_strategy_indicators(strategy)
+            strategy_htf = strategy.get("htf", False) if strategy else None
 
-            signal = await scan_symbol(symbol, market_data, risk_settings, active_indicators=active_indicators, combos=combos)
+            signal = await scan_symbol(symbol, market_data, risk_settings, active_indicators=active_indicators, combos=combos, repo=repo, htf=strategy_htf)
             if not signal or not signal.get("direction"):
+                # Log indicator states for debugging
+                if signal and signal.get("indicators"):
+                    indicator_summary = {k: v.get("signal", "n/a") for k, v in signal["indicators"].items()}
+                    logger.info("No signal for %s — indicators: %s", symbol, indicator_summary)
+                else:
+                    logger.info("No signal for %s — no indicator data returned", symbol)
                 continue
 
             signal_id = await repo.create_signal(
@@ -132,16 +178,16 @@ async def _auto_execute_signal(
     sl = signal.get("sl_price")
     tp = signal.get("tp_price")
     if not sl or not tp:
-        sl, tp = risk_mgr.calculate_sl_tp(entry, side, sz_decimals=sz_decimals)
+        sl, tp = risk_mgr.calculate_sl_tp(entry, side, sz_decimals=sz_decimals, leverage=leverage)
 
     # Validate SL/TP against entry price (S/R levels may be too close after price movement)
     min_distance = entry * 0.01
     if side.lower() == "long":
         if not sl or entry - sl < min_distance or not tp or tp - entry < min_distance:
-            sl, tp = risk_mgr.calculate_sl_tp(entry, side, sz_decimals=sz_decimals)
+            sl, tp = risk_mgr.calculate_sl_tp(entry, side, sz_decimals=sz_decimals, leverage=leverage)
     else:
         if not sl or sl - entry < min_distance or not tp or entry - tp < min_distance:
-            sl, tp = risk_mgr.calculate_sl_tp(entry, side, sz_decimals=sz_decimals)
+            sl, tp = risk_mgr.calculate_sl_tp(entry, side, sz_decimals=sz_decimals, leverage=leverage)
 
     result = await order_mgr.market_order(symbol, side, size, sl, tp, sz_decimals=sz_decimals)
     text = formatters.format_trade_result(result)
@@ -233,6 +279,56 @@ async def collect_funding_oi(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.warning("No funding/OI data returned")
     except Exception:
         logger.exception("Failed to collect funding/OI snapshots")
+
+
+async def collect_news_sentiment(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Collect news sentiment from CryptoCompare for watchlist symbols."""
+    repo = context.bot_data["repo"]
+    news_collector = context.bot_data.get("news_collector")
+    if not news_collector:
+        return
+
+    try:
+        symbols = await repo.get_watchlist()
+        news_items = await news_collector.collect_all(symbols)
+        if news_items:
+            count = await repo.insert_news_batch(news_items)
+            logger.info("Collected news sentiment: %d items", count)
+        else:
+            logger.debug("No news sentiment collected")
+    except Exception:
+        logger.exception("Failed to collect news sentiment")
+
+
+async def detect_whale_activity(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Detect whale activity from OI spikes and CoinGlass API."""
+    repo = context.bot_data["repo"]
+    whale_detector = context.bot_data.get("whale_detector")
+    if not whale_detector:
+        return
+
+    try:
+        all_events = []
+
+        # OI spike detection from our own snapshots
+        oi_events = await whale_detector.detect_oi_spikes(repo, settings.whale_oi_threshold_pct)
+        all_events.extend(oi_events)
+
+        # CoinGlass whale positions (if API key configured)
+        if settings.coinglass_api_key:
+            whale_positions = await whale_detector.fetch_coinglass_whales()
+            all_events.extend(whale_positions)
+
+            whale_alerts = await whale_detector.fetch_coinglass_alerts()
+            all_events.extend(whale_alerts)
+
+        if all_events:
+            count = await repo.insert_whale_events_batch(all_events)
+            logger.info("Detected whale activity: %d events", count)
+        else:
+            logger.debug("No whale activity detected")
+    except Exception:
+        logger.exception("Failed to detect whale activity")
 
 
 async def health_check(context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -35,9 +35,28 @@ class HyperliquidClient:
     def info(self) -> Info:
         return self._info
 
-    async def _run_sync(self, func, *args, **kwargs):
-        """Run a synchronous SDK call in a thread executor."""
-        return await asyncio.to_thread(partial(func, *args, **kwargs))
+    # Methods that modify state — never auto-retry these
+    _WRITE_METHODS = {"market_open", "market_close", "order", "cancel", "update_leverage", "bulk_orders"}
+
+    async def _run_sync(self, func, *args, retries: int = 3, **kwargs):
+        """Run a synchronous SDK call in a thread executor with retry on connection errors.
+
+        Write operations (orders, cancels) are NOT retried to prevent duplicate execution.
+        """
+        func_name = getattr(func, "__name__", str(func))
+        is_write = func_name in self._WRITE_METHODS
+        max_attempts = 1 if is_write else retries
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return await asyncio.to_thread(partial(func, *args, **kwargs))
+            except (ConnectionError, OSError) as e:
+                if attempt == max_attempts:
+                    logger.error("API call %s failed after %d attempt(s): %s", func_name, attempt, e)
+                    raise
+                wait = attempt * 2
+                logger.warning("API call %s failed (attempt %d/%d): %s — retrying in %ds", func_name, attempt, retries, e, wait)
+                await asyncio.sleep(wait)
 
     async def get_balances(self) -> dict:
         """Get spot and perpetual account balances."""

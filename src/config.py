@@ -30,8 +30,20 @@ class Settings:
     max_leverage: int = 5
     default_sl_pct: float = 3.0
     default_tp_pct: float = 6.0
+    sl_margin_pct: float = 15.0  # Max % of margin to lose on SL hit
     daily_loss_limit: float = 200.0
     max_open_positions: int = 5
+
+    # Sentiment & Whale tracking
+    cryptopanic_api_key: str = ""
+    coinglass_api_key: str = ""
+    whale_oi_threshold_pct: float = 5.0
+
+    # Scan timeframe (e.g., 1m, 5m, 15m, 1h, 4h)
+    scan_interval: str = "15m"
+
+    # Higher-timeframe confirmation: filter signals against 1h EMA trend
+    htf_confirmation: bool = False
 
 
 def _parse_user_ids(raw: str) -> list[int]:
@@ -58,8 +70,14 @@ def load_settings() -> Settings:
         max_leverage=int(os.getenv("MAX_LEVERAGE", "5")),
         default_sl_pct=float(os.getenv("DEFAULT_SL_PCT", "3")),
         default_tp_pct=float(os.getenv("DEFAULT_TP_PCT", "6")),
+        sl_margin_pct=float(os.getenv("SL_MARGIN_PCT", "15")),
         daily_loss_limit=float(os.getenv("DAILY_LOSS_LIMIT", "200")),
         max_open_positions=int(os.getenv("MAX_OPEN_POSITIONS", "5")),
+        cryptopanic_api_key=os.getenv("CRYPTOPANIC_API_KEY", ""),
+        coinglass_api_key=os.getenv("COINGLASS_API_KEY", ""),
+        whale_oi_threshold_pct=float(os.getenv("WHALE_OI_THRESHOLD_PCT", "5.0")),
+        scan_interval=os.getenv("SCAN_INTERVAL", "15m"),
+        htf_confirmation=os.getenv("HTF_CONFIRMATION", "false").lower() == "true",
     )
 
 

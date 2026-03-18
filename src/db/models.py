@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS strategies (
     symbol TEXT NOT NULL UNIQUE,
     indicators TEXT NOT NULL,
     auto_execute BOOLEAN DEFAULT 0,
+    htf BOOLEAN DEFAULT 0,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -85,6 +86,31 @@ CREATE TABLE IF NOT EXISTS funding_oi_snapshots (
 );
 
 CREATE INDEX IF NOT EXISTS idx_funding_oi_symbol_ts ON funding_oi_snapshots (symbol, timestamp);
+
+CREATE TABLE IF NOT EXISTS news_sentiment (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT,
+    headline TEXT NOT NULL,
+    source TEXT,
+    sentiment TEXT CHECK(sentiment IN ('bullish', 'bearish', 'neutral')),
+    sentiment_score REAL DEFAULT 0,
+    url TEXT,
+    published_at DATETIME,
+    collected_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_news_symbol_ts ON news_sentiment (symbol, collected_at);
+
+CREATE TABLE IF NOT EXISTS whale_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    event_type TEXT NOT NULL CHECK(event_type IN ('oi_spike', 'whale_position', 'whale_alert')),
+    direction TEXT CHECK(direction IN ('long', 'short', 'unknown')),
+    magnitude REAL,
+    detail TEXT,
+    source TEXT DEFAULT 'hyperliquid',
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_whale_symbol_ts ON whale_events (symbol, timestamp);
 """
 
 DEFAULT_RISK_SETTINGS = {
@@ -111,6 +137,13 @@ async def init_db(db_path: str | None = None) -> None:
             await db.commit()
         except Exception:
             pass  # Columns already exist
+
+        # Migrate strategies table to add htf column
+        try:
+            await db.execute("ALTER TABLE strategies ADD COLUMN htf BOOLEAN DEFAULT 0")
+            await db.commit()
+        except Exception:
+            pass  # Column already exists
 
         for key, value in DEFAULT_RISK_SETTINGS.items():
             await db.execute(

@@ -190,15 +190,16 @@ class Repository:
 
     # ── Strategies ────────────────────────────────────────────
 
-    async def create_strategy(self, symbol: str, indicators: list, auto_execute: bool = False) -> int:
+    async def create_strategy(self, symbol: str, indicators: list, auto_execute: bool = False, htf: bool = False) -> int:
         cursor = await self.db.execute(
-            """INSERT INTO strategies (symbol, indicators, auto_execute)
-               VALUES (?, ?, ?)
+            """INSERT INTO strategies (symbol, indicators, auto_execute, htf)
+               VALUES (?, ?, ?, ?)
                ON CONFLICT(symbol) DO UPDATE SET
                indicators = excluded.indicators,
                auto_execute = excluded.auto_execute,
+               htf = excluded.htf,
                updated_at = CURRENT_TIMESTAMP""",
-            (symbol, json.dumps(indicators), auto_execute),
+            (symbol, json.dumps(indicators), auto_execute, htf),
         )
         await self.db.commit()
         return cursor.lastrowid  # type: ignore[return-value]
@@ -236,6 +237,14 @@ class Repository:
         cursor = await self.db.execute(
             "UPDATE strategies SET auto_execute = ?, updated_at = CURRENT_TIMESTAMP WHERE symbol = ?",
             (auto_execute, symbol),
+        )
+        await self.db.commit()
+        return cursor.rowcount > 0
+
+    async def toggle_strategy_htf(self, symbol: str, htf: bool) -> bool:
+        cursor = await self.db.execute(
+            "UPDATE strategies SET htf = ?, updated_at = CURRENT_TIMESTAMP WHERE symbol = ?",
+            (htf, symbol),
         )
         await self.db.commit()
         return cursor.rowcount > 0
@@ -310,6 +319,80 @@ class Repository:
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
+
+    # ── News Sentiment ─────────────────────────────────────────
+
+    async def insert_news_batch(self, items: list[dict]) -> int:
+        """Insert a batch of news sentiment items. Returns number inserted."""
+        if not items:
+            return 0
+        await self.db.executemany(
+            """INSERT INTO news_sentiment
+               (symbol, headline, source, sentiment, sentiment_score, url, published_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (i.get("symbol"), i["headline"], i.get("source"), i.get("sentiment"),
+                 i.get("sentiment_score", 0), i.get("url"), i.get("published_at"))
+                for i in items
+            ],
+        )
+        await self.db.commit()
+        return len(items)
+
+    async def get_recent_news(self, symbol: str, hours: int = 4) -> list[dict]:
+        """Get recent news sentiment for a symbol."""
+        cursor = await self.db.execute(
+            """SELECT * FROM news_sentiment
+               WHERE symbol = ? AND collected_at >= datetime('now', ?)
+               ORDER BY collected_at DESC""",
+            (symbol, f"-{hours} hours"),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Whale Events ─────────────────────────────────────────
+
+    async def insert_whale_event(self, event: dict) -> int:
+        """Insert a single whale event. Returns the row id."""
+        cursor = await self.db.execute(
+            """INSERT INTO whale_events
+               (symbol, event_type, direction, magnitude, detail, source)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (event["symbol"], event["event_type"], event.get("direction", "unknown"),
+             event.get("magnitude"), event.get("detail"), event.get("source", "hyperliquid")),
+        )
+        await self.db.commit()
+        return cursor.lastrowid  # type: ignore[return-value]
+
+    async def insert_whale_events_batch(self, events: list[dict]) -> int:
+        """Insert a batch of whale events. Returns number inserted."""
+        if not events:
+            return 0
+        await self.db.executemany(
+            """INSERT INTO whale_events
+               (symbol, event_type, direction, magnitude, detail, source)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            [
+                (e["symbol"], e["event_type"], e.get("direction", "unknown"),
+                 e.get("magnitude"), e.get("detail"), e.get("source", "hyperliquid"))
+                for e in events
+            ],
+        )
+        await self.db.commit()
+        return len(events)
+
+    async def get_recent_whale_events(self, symbol: str, hours: int = 2) -> list[dict]:
+        """Get recent whale events for a symbol."""
+        cursor = await self.db.execute(
+            """SELECT * FROM whale_events
+               WHERE symbol = ? AND timestamp >= datetime('now', ?)
+               ORDER BY timestamp DESC""",
+            (symbol, f"-{hours} hours"),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    # ── Cleanup ──────────────────────────────────────────────
 
     async def cleanup_old_snapshots(self, days: int = 90) -> int:
         """Delete funding/OI snapshots older than N days."""

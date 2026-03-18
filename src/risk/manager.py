@@ -140,16 +140,36 @@ class RiskManager:
         sl_pct: float | None = None,
         tp_pct: float | None = None,
         sz_decimals: int = 0,
+        leverage: float = 1.0,
     ) -> tuple[float, float]:
-        sl_pct = sl_pct or settings.default_sl_pct
-        tp_pct = tp_pct or settings.default_tp_pct
+        """Calculate SL/TP prices, capping SL at max margin loss.
+
+        SL price distance = sl_margin_pct / leverage.
+        E.g., 15% margin risk at 5x leverage = 3% price move SL.
+        TP defaults to 2× the SL distance (2:1 reward/risk).
+        """
+        # Margin-based SL: max price move = margin_risk% / leverage
+        max_sl_price_pct = settings.sl_margin_pct / leverage
+
+        # Use the tighter of: configured SL% or margin-based SL%
+        configured_sl_pct = sl_pct or settings.default_sl_pct
+        effective_sl_pct = min(configured_sl_pct, max_sl_price_pct)
+
+        # TP: use configured, but at minimum 2:1 reward/risk
+        configured_tp_pct = tp_pct or settings.default_tp_pct
+        effective_tp_pct = max(configured_tp_pct, effective_sl_pct * 2)
 
         if side.lower() == "long":
-            sl = entry_price * (1 - sl_pct / 100)
-            tp = entry_price * (1 + tp_pct / 100)
+            sl = entry_price * (1 - effective_sl_pct / 100)
+            tp = entry_price * (1 + effective_tp_pct / 100)
         else:
-            sl = entry_price * (1 + sl_pct / 100)
-            tp = entry_price * (1 - tp_pct / 100)
+            sl = entry_price * (1 + effective_sl_pct / 100)
+            tp = entry_price * (1 - effective_tp_pct / 100)
+
+        logger.info(
+            "SL/TP calculated: leverage=%.0fx, sl=%.2f%% (margin risk=%.1f%%), tp=%.2f%% (R:R=1:%.1f)",
+            leverage, effective_sl_pct, effective_sl_pct * leverage, effective_tp_pct, effective_tp_pct / effective_sl_pct,
+        )
 
         from src.exchange.orders import _round_price
         return _round_price(sl, sz_decimals), _round_price(tp, sz_decimals)

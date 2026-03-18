@@ -45,7 +45,7 @@ def _format_strategy_indicators(indicators: list) -> str:
 
 def _parse_indicator_input(text: str) -> list:
     """Parse indicator input: 'fvg+ad,ema+ad' -> [['fvg','ad'],['ema','ad']], 'ema,rsi' -> ['ema','rsi']."""
-    all_indicators = {"ema", "rsi", "macd", "support_resistance", "volume", "fvg", "ad", "stoch_rsi", "funding_rate", "open_interest"}
+    all_indicators = {"ema", "rsi", "macd", "support_resistance", "volume", "fvg", "ad", "stoch_rsi", "funding_rate", "open_interest", "news_sentiment", "whale_activity"}
     parts = [p.strip().lower() for p in text.split(",")]
 
     has_combos = any("+" in p for p in parts)
@@ -165,7 +165,7 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         try:
             strategy = strategy_map.get(symbol)
             active_indicators, combos = _parse_strategy_indicators(strategy)
-            signal = await scan_symbol(symbol, market_data, risk_settings, active_indicators=active_indicators, combos=combos)
+            signal = await scan_symbol(symbol, market_data, risk_settings, active_indicators=active_indicators, combos=combos, repo=repo)
             if signal and signal.get("direction"):
                 signal_id = await repo.create_signal(
                     symbol=signal["symbol"],
@@ -252,7 +252,7 @@ async def limit_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     market_info = await market_data.get_market_info(symbol)
     sz_decimals = market_info.get("sz_decimals", 0)
 
-    sl, tp = risk_mgr.calculate_sl_tp(price, side, sz_decimals=sz_decimals)
+    sl, tp = risk_mgr.calculate_sl_tp(price, side, sz_decimals=sz_decimals, leverage=leverage)
     order_mgr = _get_order_mgr(context)
     result = await order_mgr.limit_order(symbol, side, price, size, sl, tp, sz_decimals=sz_decimals)
     await update.message.reply_text(formatters.format_trade_result(result))
@@ -469,6 +469,8 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "\U0001f4ca Backtest Usage:\n\n"
             "/backtest <symbol> [days] \u2014 Standard backtest\n"
             "/backtest <symbol> [days] breakdown \u2014 Indicator breakdown\n"
+            "/backtest <symbol> [days] htf \u2014 With 1h trend filter\n"
+            "/backtest <symbol> [days] breakdown htf \u2014 Breakdown with vs without HTF\n"
             "/backtest <symbol> [days] strategy \u2014 Use saved strategy\n"
             "/backtest <symbol> [days] ema,rsi,ad \u2014 Specific indicators\n"
             "/backtest <symbol> [days] fvg+ad,ema+ad \u2014 Combo strategy\n\n"
@@ -481,14 +483,15 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     flags = [a.lower() for a in args]
     breakdown = "breakdown" in flags
     use_strategy = "strategy" in flags
+    use_htf = "htf" in flags
 
     # Check if any arg looks like inline indicators
-    all_ind_names = {"ema", "rsi", "macd", "support_resistance", "volume", "fvg", "ad", "stoch_rsi", "funding_rate", "open_interest"}
+    all_ind_names = {"ema", "rsi", "macd", "support_resistance", "volume", "fvg", "ad", "stoch_rsi", "funding_rate", "open_interest", "news_sentiment", "whale_activity"}
     strategy_indicators = None
     strategy_combos = None
     for a in args[1:]:
         a_lower = a.lower()
-        if a_lower in ("breakdown", "strategy") or a_lower.isdigit():
+        if a_lower in ("breakdown", "strategy", "htf") or a_lower.isdigit():
             continue
         parts = [p.strip() for p in a_lower.replace("+", ",").split(",")]
         if all(p in all_ind_names for p in parts):
@@ -559,13 +562,45 @@ async def backtest_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         except Exception:
             logger.warning("Could not fetch OI history for backtest: %s", symbol)
 
+        # Fetch news sentiment from DB
+        news_data = None
+        try:
+            repo = _get_repo(context)
+            news_rows = await repo.get_recent_news(symbol, hours=days * 24)
+            if news_rows:
+                news_data = pd.DataFrame(news_rows)
+                news_data["collected_at"] = pd.to_datetime(news_data["collected_at"])
+        except Exception:
+            logger.warning("Could not fetch news sentiment for backtest: %s", symbol)
+
+        # Fetch whale events from DB
+        whale_data = None
+        try:
+            repo = _get_repo(context)
+            whale_rows = await repo.get_recent_whale_events(symbol, hours=days * 24)
+            if whale_rows:
+                whale_data = pd.DataFrame(whale_rows)
+                whale_data["timestamp"] = pd.to_datetime(whale_data["timestamp"])
+        except Exception:
+            logger.warning("Could not fetch whale events for backtest: %s", symbol)
+
         from src.analysis.backtest import run_backtest, run_indicator_breakdown
 
-        if breakdown:
-            results = run_indicator_breakdown(df, symbol, days, funding_data=funding_data, oi_data=oi_data)
+        extra_kw = dict(funding_data=funding_data, oi_data=oi_data, news_data=news_data, whale_data=whale_data)
+
+        if breakdown and use_htf:
+            # Compare: run breakdown without and with HTF
+            results_no_htf = run_indicator_breakdown(df, symbol, days, htf_confirmation=False, **extra_kw)
+            results_htf = run_indicator_breakdown(df, symbol, days, htf_confirmation=True, **extra_kw)
+            text = "\U0001f4ca WITHOUT HTF Filter:\n"
+            text += formatters.format_indicator_breakdown(results_no_htf)
+            text += "\n\n\U0001f4ca WITH 1h HTF Filter:\n"
+            text += formatters.format_indicator_breakdown(results_htf)
+        elif breakdown:
+            results = run_indicator_breakdown(df, symbol, days, **extra_kw)
             text = formatters.format_indicator_breakdown(results)
         else:
-            result = run_backtest(df, symbol, days, active_indicators=strategy_indicators, combos=strategy_combos, funding_data=funding_data, oi_data=oi_data)
+            result = run_backtest(df, symbol, days, active_indicators=strategy_indicators, combos=strategy_combos, htf_confirmation=use_htf, **extra_kw)
             text = formatters.format_backtest(result)
 
         # Telegram has a 4096 char limit — split if needed
@@ -582,7 +617,7 @@ async def indicators_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     args = context.args
     if not args:
         active = ", ".join(sorted(ACTIVE_INDICATORS))
-        all_indicators = {"ema", "rsi", "macd", "support_resistance", "volume", "fvg", "ad", "stoch_rsi", "funding_rate", "open_interest"}
+        all_indicators = {"ema", "rsi", "macd", "support_resistance", "volume", "fvg", "ad", "stoch_rsi", "funding_rate", "open_interest", "news_sentiment", "whale_activity"}
         inactive = all_indicators - ACTIVE_INDICATORS
         inactive_str = ", ".join(sorted(inactive)) if inactive else "none"
         await update.message.reply_text(
@@ -599,7 +634,7 @@ async def indicators_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     action = args[0].lower()
     if action in ("enable", "disable") and len(args) > 1:
         ind = args[1].lower()
-        all_indicators = {"ema", "rsi", "macd", "support_resistance", "volume", "fvg", "ad", "stoch_rsi", "funding_rate", "open_interest"}
+        all_indicators = {"ema", "rsi", "macd", "support_resistance", "volume", "fvg", "ad", "stoch_rsi", "funding_rate", "open_interest", "news_sentiment", "whale_activity"}
         if ind not in all_indicators:
             await update.message.reply_text(f"Unknown indicator: {ind}\nAvailable: {', '.join(sorted(all_indicators))}")
             return
@@ -622,11 +657,11 @@ async def strategy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     repo = _get_repo(context)
     args = context.args
 
-    # /strategy create HYPE fvg+ad,ema+ad
+    # /strategy create HYPE fvg+ad,ema+ad [htf]
     if args and args[0].lower() == "create" and len(args) >= 3:
         symbol = args[1].upper()
         parsed = _parse_indicator_input(args[2])
-        all_indicators = {"ema", "rsi", "macd", "support_resistance", "volume", "fvg", "ad", "stoch_rsi", "funding_rate", "open_interest"}
+        all_indicators = {"ema", "rsi", "macd", "support_resistance", "volume", "fvg", "ad", "stoch_rsi", "funding_rate", "open_interest", "news_sentiment", "whale_activity"}
         if isinstance(parsed[0], list):
             flat = [i for combo in parsed for i in combo]
         else:
@@ -639,13 +674,15 @@ async def strategy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
             return
 
-        await repo.create_strategy(symbol, parsed, auto_execute=False)
+        htf_on = "htf" in [a.lower() for a in args[3:]]
+        await repo.create_strategy(symbol, parsed, auto_execute=False, htf=htf_on)
         await repo.add_to_watchlist(symbol)
         display = _format_strategy_indicators(parsed)
+        htf_label = " | HTF: \u2705" if htf_on else ""
         await update.message.reply_text(
             f"\u2705 Strategy saved for {symbol}\n"
             f"Indicators: {display}\n"
-            f"Mode: \u270b MANUAL",
+            f"Mode: \u270b MANUAL{htf_label}",
         )
         return
 
@@ -664,6 +701,22 @@ async def strategy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await repo.toggle_strategy_auto(symbol, auto)
         label = "\U0001f916 AUTO" if auto else "\u270b MANUAL"
         await update.message.reply_text(f"{symbol} strategy set to {label}")
+        return
+
+    # /strategy htf HYPE on|off
+    if args and args[0].lower() == "htf" and len(args) >= 3:
+        symbol = args[1].upper()
+        toggle = args[2].lower()
+        if toggle not in ("on", "off"):
+            await update.message.reply_text("Usage: /strategy htf <symbol> <on|off>")
+            return
+        strategy = await repo.get_strategy(symbol)
+        if not strategy:
+            await update.message.reply_text(f"No strategy found for {symbol}.")
+            return
+        await repo.toggle_strategy_htf(symbol, toggle == "on")
+        label = "\u2705 ON" if toggle == "on" else "\u274c OFF"
+        await update.message.reply_text(f"{symbol} HTF (1h trend filter): {label}")
         return
 
     # /strategy delete HYPE
@@ -694,12 +747,14 @@ async def strategy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     lines = ["\U0001f3af Strategies"]
     for s in strategies:
         auto = "\U0001f916 AUTO" if s["auto_execute"] else "\u270b MANUAL"
+        htf = " | HTF \u2705" if s.get("htf") else ""
         inds = _format_strategy_indicators(s["indicators"])
-        lines.append(f"\n{s['symbol']}  {auto}\n  {inds}")
+        lines.append(f"\n{s['symbol']}  {auto}{htf}\n  {inds}")
     lines.append(
         "\n\nManage:\n"
-        "/strategy create <symbol> <indicators>\n"
+        "/strategy create <symbol> <indicators> [htf]\n"
         "/strategy auto <symbol> <on|off>\n"
+        "/strategy htf <symbol> <on|off>\n"
         "/strategy delete <symbol>"
     )
     await update.message.reply_text("\n".join(lines))
@@ -800,10 +855,10 @@ async def execute_signal_callback(update: Update, context: ContextTypes.DEFAULT_
     min_distance = entry * 0.01
     if side.lower() == "long":
         if not sl_price or entry - sl_price < min_distance or not tp_price or tp_price - entry < min_distance:
-            sl_price, tp_price = risk_mgr.calculate_sl_tp(entry, side, sz_decimals=sz_decimals)
+            sl_price, tp_price = risk_mgr.calculate_sl_tp(entry, side, sz_decimals=sz_decimals, leverage=leverage)
     else:
         if not sl_price or sl_price - entry < min_distance or not tp_price or entry - tp_price < min_distance:
-            sl_price, tp_price = risk_mgr.calculate_sl_tp(entry, side, sz_decimals=sz_decimals)
+            sl_price, tp_price = risk_mgr.calculate_sl_tp(entry, side, sz_decimals=sz_decimals, leverage=leverage)
 
     await _execute_trade(
         update, context, symbol, side, size,
@@ -942,7 +997,7 @@ async def _execute_trade(
     if sl_price and tp_price:
         sl, tp = sl_price, tp_price
     else:
-        sl, tp = risk_mgr.calculate_sl_tp(price, side, sz_decimals=sz_decimals)
+        sl, tp = risk_mgr.calculate_sl_tp(price, side, sz_decimals=sz_decimals, leverage=leverage)
     order_mgr = _get_order_mgr(context)
     result = await order_mgr.market_order(symbol, side, size, sl, tp, sz_decimals=sz_decimals)
     text = formatters.format_trade_result(result)
